@@ -29,6 +29,7 @@ use clap::{Arg, ArgMatches};
 use log::{error, info, warn};
 
 mod output;
+mod display;
 
 fn main() {
     pretty_env_logger::init();
@@ -196,11 +197,12 @@ fn play(
 
     // The audio output device.
     let mut audio_output = None;
+    let mut display = None;
 
     let mut track_info = PlayTrackOptions { track_id, seek_ts };
 
     let result = loop {
-        match play_track(&mut reader, &mut audio_output, track_info, decode_opts, no_progress) {
+        match play_track(&mut reader, &mut audio_output, &mut display, track_info, decode_opts, no_progress) {
             Err(Error::ResetRequired) => {
                 // The demuxer indicated that a reset is required. This is sometimes seen with
                 // streaming OGG (e.g., Icecast) wherein the entire contents of the container change
@@ -228,6 +230,7 @@ fn play(
 fn play_track(
     reader: &mut Box<dyn FormatReader>,
     audio_output: &mut Option<Box<dyn output::AudioOutput>>,
+    display: &mut Option<Box<dyn display::Display>>,
     play_opts: PlayTrackOptions,
     decode_opts: &DecoderOptions,
     no_progress: bool,
@@ -261,6 +264,7 @@ fn play_track(
         // Decode the packet into audio samples.
         match decoder.decode(&packet) {
             Ok(decoded) => {
+
                 // If the audio output is not open, try to open it.
                 if audio_output.is_none() {
                     // Get the audio buffer specification. This is a description of the decoded
@@ -275,19 +279,35 @@ fn play_track(
                     // Try to open the audio output.
                     audio_output.replace(output::try_open(spec, duration).unwrap());
                 }
-                else {
-                    // TODO: Check the audio spec. and duration hasn't changed.
+
+                if display.is_none() {
+                    // Get the audio buffer specification. This is a description of the decoded
+                    // audio buffer's sample format and sample rate.
+                    let spec = *decoded.spec();
+
+                    // Get the capacity of the decoded buffer. Note that this is capacity, not
+                    // length! The capacity of the decoded buffer is constant for the life of the
+                    // decoder, but the length is not.
+                    let duration = decoded.capacity() as u64;
+
+                    // Try to open the audio output.
+                    display.replace(display::try_open(spec, duration).unwrap());
                 }
+
 
                 // Write the decoded audio samples to the audio output if the presentation timestamp
                 // for the packet is >= the seeked position (0 if not seeking).
                 if packet.ts() >= play_opts.seek_ts {
                     if !no_progress {
-                        print_progress(packet.ts(), dur, tb);
+                        // print_progress(packet.ts(), dur, tb);
                     }
 
                     if let Some(audio_output) = audio_output {
-                        audio_output.write(decoded).unwrap()
+                        audio_output.write(decoded.clone()).unwrap()
+                    }
+
+                    if let Some(display) = display {
+                        display.write(decoded).unwrap()
                     }
                 }
             }
