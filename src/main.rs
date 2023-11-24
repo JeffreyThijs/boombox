@@ -19,10 +19,10 @@ use std::path::Path;
 use lazy_static::lazy_static;
 use symphonia::core::codecs::{DecoderOptions, FinalizeResult, CODEC_TYPE_NULL};
 use symphonia::core::errors::{Error, Result};
-use symphonia::core::formats::{Cue, FormatOptions, FormatReader, SeekMode, SeekTo, Track};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track};
 use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
-use symphonia::core::meta::{ColorMode, MetadataOptions, MetadataRevision, Tag, Value, Visual};
-use symphonia::core::probe::{Hint, ProbeResult};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use symphonia::core::units::{Time, TimeBase};
 
 use clap::{Arg, ArgMatches};
@@ -42,29 +42,10 @@ fn main() {
                 .long("seek")
                 .short('s')
                 .value_name("TIME")
-                .help("Seek to the given time in seconds")
-                .conflicts_with_all(&["verify", "decode-only", "verify-only", "probe-only"]),
+                .help("Seek to the given time in seconds"),
         )
         .arg(
             Arg::new("track").long("track").short('t').value_name("TRACK").help("The track to use"),
-        )
-        .arg(
-            Arg::new("decode-only")
-                .long("decode-only")
-                .help("Decode, but do not play the audio")
-                .conflicts_with_all(&["probe-only", "verify-only", "verify"]),
-        )
-        .arg(
-            Arg::new("probe-only")
-                .long("probe-only")
-                .help("Only probe the input for metadata")
-                .conflicts_with_all(&["decode-only", "verify-only"]),
-        )
-        .arg(
-            Arg::new("verify-only")
-                .long("verify-only")
-                .help("Verify the decoded audio is valid, but do not play the audio")
-                .conflicts_with_all(&["verify"]),
         )
         .arg(
             Arg::new("verify")
@@ -140,34 +121,16 @@ fn run(args: &ArgMatches) -> Result<i32> {
 
     // Probe the media source stream for metadata and get the format reader.
     match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
-        Ok(mut probed) => {
-            if args.is_present("verify-only") {
-                // Verify-only mode decodes and verifies the audio, but does not play it.
-                decode_only(probed.format, &DecoderOptions { verify: true, ..Default::default() })
-            }
-            else if args.is_present("decode-only") {
-                // Decode-only mode decodes the audio, but does not play or verify it.
-                decode_only(probed.format, &DecoderOptions { verify: false, ..Default::default() })
-            }
-            else if args.is_present("probe-only") {
-                // Probe-only mode only prints information about the format, tracks, metadata, etc.
-                print_format(path_str, &mut probed);
-                Ok(0)
-            }
-            else {
-                // Playback mode.
-                print_format(path_str, &mut probed);
+        Ok(probed) => {
+            // If present, parse the seek argument.
+            let seek_time = args.value_of("seek").map(|p| p.parse::<f64>().unwrap_or(0.0));
 
-                // If present, parse the seek argument.
-                let seek_time = args.value_of("seek").map(|p| p.parse::<f64>().unwrap_or(0.0));
+            // Set the decoder options.
+            let decode_opts =
+                DecoderOptions { verify: args.is_present("verify"), ..Default::default() };
 
-                // Set the decoder options.
-                let decode_opts =
-                    DecoderOptions { verify: args.is_present("verify"), ..Default::default() };
-
-                // Play it!
-                play(probed.format, track, seek_time, &decode_opts, no_progress)
-            }
+            // Play it!
+            play(probed.format, track, seek_time, &decode_opts, no_progress)
         }
         Err(err) => {
             // The input was not supported by any format reader.
@@ -175,42 +138,6 @@ fn run(args: &ArgMatches) -> Result<i32> {
             Err(err)
         }
     }
-}
-
-fn decode_only(mut reader: Box<dyn FormatReader>, decode_opts: &DecoderOptions) -> Result<i32> {
-    // Get the default track.
-    // TODO: Allow track selection.
-    let track = reader.default_track().unwrap();
-    let track_id = track.id;
-
-    // Create a decoder for the track.
-    let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, decode_opts)?;
-
-    // Decode all packets, ignoring all decode errors.
-    let result = loop {
-        let packet = match reader.next_packet() {
-            Ok(packet) => packet,
-            Err(err) => break Err(err),
-        };
-
-        // If the packet does not belong to the selected track, skip over it.
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        // Decode the packet into audio samples.
-        match decoder.decode(&packet) {
-            Ok(_decoded) => continue,
-            Err(Error::DecodeError(err)) => warn!("decode error: {}", err),
-            Err(err) => break Err(err),
-        }
-    };
-
-    // Return if a fatal error occured.
-    ignore_end_of_stream_error(result)?;
-
-    // Finalize the decoder and return the verification result if it's been enabled.
-    do_verification(decoder.finalize())
 }
 
 #[derive(Copy, Clone)]
@@ -331,15 +258,6 @@ fn play_track(
             continue;
         }
 
-        //Print out new metadata.
-        while !reader.metadata().is_latest() {
-            reader.metadata().pop();
-
-            if let Some(rev) = reader.metadata().current() {
-                print_update(rev);
-            }
-        }
-
         // Decode the packet into audio samples.
         match decoder.decode(&packet) {
             Ok(decoded) => {
@@ -424,39 +342,6 @@ fn do_verification(finalization: FinalizeResult) -> Result<i32> {
     }
 }
 
-fn print_format(path: &str, probed: &mut ProbeResult) {
-    println!("+ {}", path);
-    print_tracks(probed.format.tracks());
-
-    // Prefer metadata that's provided in the container format, over other tags found during the
-    // probe operation.
-    if let Some(metadata_rev) = probed.format.metadata().current() {
-        print_tags(metadata_rev.tags());
-        print_visuals(metadata_rev.visuals());
-
-        // Warn that certain tags are preferred.
-        if probed.metadata.get().as_ref().is_some() {
-            info!("tags that are part of the container format are preferentially printed.");
-            info!("not printing additional tags that were found while probing.");
-        }
-    }
-    else if let Some(metadata_rev) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
-        print_tags(metadata_rev.tags());
-        print_visuals(metadata_rev.visuals());
-    }
-
-    print_cues(probed.format.cues());
-    println!(":");
-    println!();
-}
-
-fn print_update(rev: &MetadataRevision) {
-    print_tags(rev.tags());
-    print_visuals(rev.visuals());
-    println!(":");
-    println!();
-}
-
 fn print_tracks(tracks: &[Track]) {
     if !tracks.is_empty() {
         println!("|");
@@ -530,155 +415,6 @@ fn print_tracks(tracks: &[Track]) {
     }
 }
 
-fn print_cues(cues: &[Cue]) {
-    if !cues.is_empty() {
-        println!("|");
-        println!("| // Cues //");
-
-        for (idx, cue) in cues.iter().enumerate() {
-            println!("|     [{:0>2}] Track:      {}", idx + 1, cue.index);
-            println!("|          Timestamp:  {}", cue.start_ts);
-
-            // Print tags associated with the Cue.
-            if !cue.tags.is_empty() {
-                println!("|          Tags:");
-
-                for (tidx, tag) in cue.tags.iter().enumerate() {
-                    if let Some(std_key) = tag.std_key {
-                        println!(
-                            "{}",
-                            print_tag_item(tidx + 1, &format!("{:?}", std_key), &tag.value, 21)
-                        );
-                    }
-                    else {
-                        println!("{}", print_tag_item(tidx + 1, &tag.key, &tag.value, 21));
-                    }
-                }
-            }
-
-            // Print any sub-cues.
-            if !cue.points.is_empty() {
-                println!("|          Sub-Cues:");
-
-                for (ptidx, pt) in cue.points.iter().enumerate() {
-                    println!(
-                        "|                      [{:0>2}] Offset:    {:?}",
-                        ptidx + 1,
-                        pt.start_offset_ts
-                    );
-
-                    // Start the number of sub-cue tags, but don't print them.
-                    if !pt.tags.is_empty() {
-                        println!(
-                            "|                           Sub-Tags:  {} (not listed)",
-                            pt.tags.len()
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn print_tags(tags: &[Tag]) {
-    if !tags.is_empty() {
-        println!("|");
-        println!("| // Tags //");
-
-        let mut idx = 1;
-
-        // Print tags with a standard tag key first, these are the most common tags.
-        for tag in tags.iter().filter(|tag| tag.is_known()) {
-            if let Some(std_key) = tag.std_key {
-                println!("{}", print_tag_item(idx, &format!("{:?}", std_key), &tag.value, 4));
-            }
-            idx += 1;
-        }
-
-        // Print the remaining tags with keys truncated to 26 characters.
-        for tag in tags.iter().filter(|tag| !tag.is_known()) {
-            println!("{}", print_tag_item(idx, &tag.key, &tag.value, 4));
-            idx += 1;
-        }
-    }
-}
-
-fn print_visuals(visuals: &[Visual]) {
-    if !visuals.is_empty() {
-        println!("|");
-        println!("| // Visuals //");
-
-        for (idx, visual) in visuals.iter().enumerate() {
-            if let Some(usage) = visual.usage {
-                println!("|     [{:0>2}] Usage:      {:?}", idx + 1, usage);
-                println!("|          Media Type: {}", visual.media_type);
-            }
-            else {
-                println!("|     [{:0>2}] Media Type: {}", idx + 1, visual.media_type);
-            }
-            if let Some(dimensions) = visual.dimensions {
-                println!(
-                    "|          Dimensions: {} px x {} px",
-                    dimensions.width, dimensions.height
-                );
-            }
-            if let Some(bpp) = visual.bits_per_pixel {
-                println!("|          Bits/Pixel: {}", bpp);
-            }
-            if let Some(ColorMode::Indexed(colors)) = visual.color_mode {
-                println!("|          Palette:    {} colors", colors);
-            }
-            println!("|          Size:       {} bytes", visual.data.len());
-
-            // Print out tags similar to how regular tags are printed.
-            if !visual.tags.is_empty() {
-                println!("|          Tags:");
-            }
-
-            for (tidx, tag) in visual.tags.iter().enumerate() {
-                if let Some(std_key) = tag.std_key {
-                    println!(
-                        "{}",
-                        print_tag_item(tidx + 1, &format!("{:?}", std_key), &tag.value, 21)
-                    );
-                }
-                else {
-                    println!("{}", print_tag_item(tidx + 1, &tag.key, &tag.value, 21));
-                }
-            }
-        }
-    }
-}
-
-fn print_tag_item(idx: usize, key: &str, value: &Value, indent: usize) -> String {
-    let key_str = match key.len() {
-        0..=28 => format!("| {:w$}[{:0>2}] {:<28} : ", "", idx, key, w = indent),
-        _ => format!("| {:w$}[{:0>2}] {:.<28} : ", "", idx, key.split_at(26).0, w = indent),
-    };
-
-    let line_prefix = format!("\n| {:w$} : ", "", w = indent + 4 + 28 + 1);
-    let line_wrap_prefix = format!("\n| {:w$}   ", "", w = indent + 4 + 28 + 1);
-
-    let mut out = String::new();
-
-    out.push_str(&key_str);
-
-    for (wrapped, line) in value.to_string().lines().enumerate() {
-        if wrapped > 0 {
-            out.push_str(&line_prefix);
-        }
-
-        let mut chars = line.chars();
-        let split = (0..)
-            .map(|_| chars.by_ref().take(72).collect::<String>())
-            .take_while(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-
-        out.push_str(&split.join(&line_wrap_prefix));
-    }
-
-    out
-}
 
 fn fmt_time(ts: u64, tb: TimeBase) -> String {
     let time = tb.calc_time(ts);
