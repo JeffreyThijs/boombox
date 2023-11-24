@@ -1,0 +1,17 @@
+[package]
+name = "boombox"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "3.1.0"
+lazy_static = "1.4.0"
+log = { version = "0.4", features = ["release_max_level_info"] }
+pretty_env_logger = "0.4"
+symphonia = { version = "0.5.2", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.5.0"
+libpulse-simple-binding = "2.5.0"
